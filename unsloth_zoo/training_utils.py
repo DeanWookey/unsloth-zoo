@@ -513,20 +513,28 @@ def patch_trainer_for_memory_debugging(trainer):
 
 def patch_paged_optimizer_resume_fix(trainer):
     """
-    Fixes OOM when resuming from checkpoint with paged optimizers (e.g. paged_adamw_8bit).
+    Fixes OOM when resuming from checkpoint with bitsandbytes optimizers
+    (adamw_8bit, paged_adamw_8bit, etc.).
 
     Root cause:
-        torch.save/load does NOT preserve the is_paged=True attribute on tensors.
-        When optimizer states are loaded from a checkpoint, they land on GPU memory
-        without is_paged=True. bitsandbytes normally pages optimizer states between
-        CPU and GPU (only on GPU during the optimizer.step() call), but after
-        checkpoint loading they stay on GPU permanently, wasting ~9-10GB.
+        PyTorch's Optimizer.load_state_dict() always calls .to(param.device) on
+        every state tensor.  For GPU parameters this means ~9GB of optimizer states
+        land on the GPU and stay there for the entire training run.  In fresh
+        training the states are created lazily during optimizer.step(), after the
+        first forward+backward pass frees temporary activations — so peak memory
+        is lower.  With checkpoint loading all 9GB are pre-loaded before any
+        computation starts, pushing peak GPU memory over the limit.
 
-    Fix:
-        Wrap _load_optimizer_and_scheduler so that after loading, any GPU optimizer
-        state tensors are moved back to CPU in-place and marked is_paged=True.
-        bitsandbytes' prefetch_state() will then manage them correctly (it does
-        A.data = A.data.cuda() / A.data = A.data.cpu() as needed during step()).
+    Fix (post-load migration):
+        1. Let _load_optimizer_and_scheduler run normally (states go to GPU).
+        2. Immediately after: iterate inner.state and replace each GPU tensor
+           with a bitsandbytes get_paged() tensor (CUDA managed / unified memory).
+        3. Call prefetch_tensor(paged, to_cpu=True) to migrate managed memory to
+           CPU RAM.  The original GPU tensor is released, freeing ~9GB.
+        4. Set inner.is_paged=True so bitsandbytes' step() calls
+           prefetch_tensor(to_cpu=False) before each CUDA kernel (moves states to
+           GPU transiently) and prefetch_tensor(to_cpu=True) after (returns them
+           to CPU).  States occupy GPU only during optimizer.step().
 
     Usage:
         Call this BEFORE trainer.train() when resuming from a checkpoint:
@@ -565,121 +573,84 @@ def patch_paged_optimizer_resume_fix(trainer):
             print("[Unsloth] Not a bitsandbytes optimizer, using default load")
             return _orig_load(resume_from_checkpoint)
 
-        # Root cause: HF Trainer loads optimizer.pt with map_location=cuda, putting
-        # ~9GB of optimizer states on GPU before training even starts.
+        # Root cause: PyTorch optimizer.load_state_dict() always calls
+        # .to(param.device) on every state tensor, so states always land on GPU
+        # (~9GB) regardless of where they are in the saved state dict.
         #
-        # Proper fix: load directly to CPU, then copy each state tensor into a
-        # properly allocated paged tensor using bitsandbytes' own get_paged().
-        # get_paged() allocates the correct backing memory (managed/pinned) that
-        # bitsandbytes' prefetch_tensor/unget_state CUDA APIs require.
-        # States then live on CPU and are only briefly on GPU during optimizer.step().
-        # No bitsandbytes internals are patched.
+        # Correct fix (post-load migration):
+        #   1. Let _orig_load run — states land in inner.state on GPU (normal).
+        #   2. Immediately after: replace each GPU state tensor in inner.state
+        #      with a bitsandbytes get_paged() tensor (CUDA managed memory).
+        #   3. Call prefetch_tensor(paged, to_cpu=True) to move managed memory
+        #      to CPU RAM.  During optimizer.step(), bitsandbytes calls
+        #      prefetch_tensor(to_cpu=False) to pull it back to GPU, runs the
+        #      CUDA kernel, then prefetch_tensor(to_cpu=True) to return it.
+        #
+        # Result: ~9GB of optimizer states live on CPU between steps instead of
+        # permanently occupying GPU memory.
+
+        before_gb = torch.cuda.memory_allocated() / 1e9
+        result = _orig_load(resume_from_checkpoint)
+        after_gb = torch.cuda.memory_allocated() / 1e9
+        print(f"[Unsloth] After original load: {after_gb:.2f}GB "
+              f"(+{after_gb - before_gb:.2f}GB landed on GPU)")
+
         try:
             import bitsandbytes.functional as bnb_f
-
-            opt_path = os.path.join(str(resume_from_checkpoint), "optimizer.pt")
-            if not os.path.exists(opt_path):
-                print("[Unsloth] optimizer.pt not found, using default load")
-                return _orig_load(resume_from_checkpoint)
-
-            # Load state dict to CPU — never touches GPU
-            state_dict = torch.load(opt_path, map_location="cpu")
-
-            # Debug: print the top-level structure to understand format
-            if isinstance(state_dict, dict):
-                top_keys = list(state_dict.keys())
-                print(f"[Unsloth] state_dict type=dict, top-level keys={top_keys}")
-                for k in top_keys[:5]:
-                    v = state_dict[k]
-                    print(f"  [{k}]: type={type(v).__name__}", end="")
-                    if isinstance(v, dict):
-                        print(f", keys={list(v.keys())[:8]}")
-                    elif isinstance(v, list):
-                        print(f", len={len(v)}, first_type={type(v[0]).__name__ if v else 'empty'}")
-                    elif isinstance(v, torch.Tensor):
-                        print(f", shape={v.shape}, dtype={v.dtype}")
-                    else:
-                        print(f", val={v!r}"[:80])
-                # If it has a 'state' key, inspect first entry
-                if "state" in state_dict:
-                    s = state_dict["state"]
-                    print(f"  state: type={type(s).__name__}, len={len(s) if hasattr(s,'__len__') else '?'}")
-                    if isinstance(s, dict) and s:
-                        first_key = next(iter(s))
-                        first_val = s[first_key]
-                        print(f"  first state entry [{first_key}]: type={type(first_val).__name__}")
-                        if isinstance(first_val, dict):
-                            for sk, sv in list(first_val.items())[:5]:
-                                extra = f"shape={sv.shape} dtype={sv.dtype}" if isinstance(sv, torch.Tensor) else f"val={sv!r}"[:40]
-                                print(f"    {sk}: {type(sv).__name__} {extra}")
-            elif isinstance(state_dict, list):
-                print(f"[Unsloth] state_dict type=list, len={len(state_dict)}")
-                if state_dict:
-                    first = state_dict[0]
-                    print(f"  first element type={type(first).__name__}")
-                    if isinstance(first, dict):
-                        print(f"  first element keys={list(first.keys())}")
-
-            # Resolve the actual optimizer state dict — handle accelerate's various formats
-            # Accelerate may wrap the state in a list (one per optimizer) or under a key
-            opt_sd = state_dict
-            if isinstance(state_dict, list) and len(state_dict) > 0:
-                opt_sd = state_dict[0]
-                print("[Unsloth] Unwrapped list wrapper from state_dict")
-            elif isinstance(state_dict, dict) and "optimizer" in state_dict:
-                opt_sd = state_dict["optimizer"]
-                print("[Unsloth] Unwrapped 'optimizer' key from state_dict")
-
-            # Replace every state tensor with a properly paged tensor so
-            # bitsandbytes' prefetch_state/unget_state work correctly.
             device_id = torch.cuda.current_device()
             paged_count = 0
-            if isinstance(opt_sd, dict) and "state" in opt_sd:
-                state_entries = opt_sd["state"]
-                print(f"[Unsloth] Found 'state' dict with {len(state_entries)} entries")
-                for param_state in state_entries.values():
-                    if not isinstance(param_state, dict):
+            freed_bytes = 0
+
+            # inner.state maps param_tensor → {key: state_tensor, ...}
+            for p_state in inner.state.values():
+                for k, v in list(p_state.items()):
+                    # Only migrate non-scalar GPU tensors (skip step counters etc.)
+                    if not isinstance(v, torch.Tensor) or not v.is_cuda or v.numel() <= 1:
                         continue
-                    for k, v in list(param_state.items()):
-                        if isinstance(v, torch.Tensor) and v.numel() > 1:
-                            # Only page non-scalar tensors (skip step counter etc.)
-                            paged = bnb_f.get_paged(*v.shape, dtype=v.dtype)
-                            paged.page_deviceid = device_id
-                            paged.copy_(v)
-                            param_state[k] = paged
-                            paged_count += 1
-            else:
-                print(f"[Unsloth] WARNING: Could not find 'state' in opt_sd (type={type(opt_sd).__name__})")
 
-            optimizer.load_state_dict(opt_sd)
+                    # Allocate CUDA managed memory (cudaMallocManaged) and copy
+                    # the GPU state tensor into it.
+                    paged = bnb_f.get_paged(*v.shape, dtype=v.dtype)
+                    paged.is_paged    = True
+                    paged.page_deviceid = device_id
+                    paged.copy_(v)          # device memcpy: GPU → managed GPU
 
-            # Enable paging on the inner optimizer if not already set
-            # so optimizer.step() calls prefetch_state/unget_state
+                    # Replace in live optimizer state, then release the original
+                    # GPU tensor so its memory is returned to the CUDA cache.
+                    freed_bytes += v.nbytes
+                    p_state[k] = paged
+                    del v
+
+                    # Hint the CUDA runtime to migrate managed memory to CPU RAM.
+                    # bitsandbytes will call prefetch_tensor(to_cpu=False) at the
+                    # start of each step to pull it back to GPU, and
+                    # prefetch_tensor(to_cpu=True) after to return it.
+                    bnb_f.prefetch_tensor(paged, to_cpu=True)
+                    paged_count += 1
+
+            # Activate the paged step path on the optimizer so bitsandbytes
+            # calls prefetch_tensor / unget_state around each CUDA kernel.
             if not getattr(inner, 'is_paged', False):
                 inner.is_paged = True
-                print(f"[Unsloth] Enabled paging on {inner_name}")
+                print(f"[Unsloth] Enabled paged step path on {inner_name}")
 
+            # Flush CUDA allocator cache to return freed GPU memory to the OS.
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
-            print(f"[Unsloth] Optimizer loaded to CPU via get_paged() "
-                  f"({paged_count} tensors, 0GB on GPU)")
 
-            # Load scheduler separately (same as HF Trainer does)
-            sched_path = os.path.join(str(resume_from_checkpoint), "scheduler.pt")
-            lr_scheduler = getattr(trainer, 'lr_scheduler', None)
-            if os.path.exists(sched_path) and lr_scheduler is not None:
-                lr_scheduler.load_state_dict(
-                    torch.load(sched_path, map_location="cpu")
-                )
-                print("[Unsloth] Scheduler loaded")
+            final_gb = torch.cuda.memory_allocated() / 1e9
+            print(f"[Unsloth] Post-load migration complete: "
+                  f"{paged_count} tensors moved to paged CPU memory, "
+                  f"freed {freed_bytes / 1e9:.2f}GB. "
+                  f"GPU now: {final_gb:.2f}GB")
 
         except Exception as e:
             import traceback
-            print(f"[Unsloth] CPU paged load failed ({e})")
+            print(f"[Unsloth] Post-load migration failed ({e}), "
+                  f"optimizer states remain on GPU")
             traceback.print_exc()
-            print("[Unsloth] Falling back to default _load_optimizer_and_scheduler")
-            return _orig_load(resume_from_checkpoint)
 
-        return None
+        return result
 
     trainer._load_optimizer_and_scheduler = _patched_load
     print("[Unsloth] Paged optimizer resume fix installed. "
