@@ -580,13 +580,37 @@ def patch_paged_optimizer_resume_fix(trainer):
             print("[Unsloth] Paged optimizer fix: not a bitsandbytes optimizer, skipping")
             return result
 
-        # bitsandbytes paging works via three attributes on each state tensor:
-        #   is_paged=True      : marks tensor as paged (checked by prefetch_state)
-        #   page_deviceid=N    : CUDA device index for cudaMemPrefetchAsync
-        # torch.load loses all three so loaded states stay on GPU permanently.
-        # Fix: move all loaded GPU states back to CPU in-place and restore all
-        # three attributes, then set inner.is_paged=True so optimizer.step()
-        # calls prefetch_state/unget_state to page on/off GPU during update.
+        # bitsandbytes paging works by marking state tensors with is_paged=True
+        # and page_deviceid, then calling prefetch_state/unget_state in step().
+        # torch.load loses these attributes so loaded states stay on GPU.
+        #
+        # Problem: bitsandbytes' prefetch_tensor() calls cudaMemPrefetchAsync,
+        # which only works on CUDA Unified Memory (cudaMallocManaged). Our tensors
+        # moved via v.data.cpu() are plain CPU tensors, not managed memory, so
+        # cudaMemPrefetchAsync returns "invalid argument" and crashes the kernel.
+        #
+        # Fix: patch bitsandbytes.functional.prefetch_tensor to use Python-level
+        # tensor moves (A.data = A.data.cuda() / A.data = A.data.cpu()) instead
+        # of the CUDA API. This is correct for all tensor types.
+        try:
+            import bitsandbytes.functional as bnb_f
+            _orig_prefetch = bnb_f.prefetch_tensor
+
+            def _python_prefetch(A, to_cpu=False):
+                if to_cpu:
+                    if A.data.device.type != 'cpu':
+                        A.data = A.data.cpu()
+                else:
+                    if A.data.device.type == 'cpu':
+                        A.data = A.data.cuda(getattr(A, 'page_deviceid', 0))
+
+            bnb_f.prefetch_tensor = _python_prefetch
+            print("[Unsloth] Patched bitsandbytes.functional.prefetch_tensor "
+                  "to use Python-level tensor moves (avoids cudaMemPrefetchAsync "
+                  "on non-managed memory)")
+        except Exception as e:
+            print(f"[Unsloth] Could not patch prefetch_tensor: {e}")
+
         device_id = torch.cuda.current_device()
         moved = 0
         freed_bytes = 0
@@ -597,9 +621,9 @@ def patch_paged_optimizer_resume_fix(trainer):
                 for k, v in inner.state[p].items():
                     if isinstance(v, torch.Tensor) and v.is_cuda:
                         freed_bytes += v.numel() * v.element_size()
-                        v.data = v.data.cpu()    # in-place: same Python object, CPU storage
-                        v.is_paged = True         # mark for bitsandbytes prefetch_state check
-                        v.page_deviceid = device_id  # CUDA device for cudaMemPrefetchAsync
+                        v.data = v.data.cpu()        # in-place: same Python object, CPU storage
+                        v.is_paged = True             # mark for bitsandbytes prefetch_state check
+                        v.page_deviceid = device_id   # device index (needed by prefetch_tensor)
                         moved += 1
 
         if moved > 0:
