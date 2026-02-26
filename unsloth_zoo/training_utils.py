@@ -543,101 +543,88 @@ def patch_paged_optimizer_resume_fix(trainer):
     _orig_load = trainer._load_optimizer_and_scheduler
 
     def _patched_load(resume_from_checkpoint):
-        result = _orig_load(resume_from_checkpoint)
-
-        # Only act when actually resuming from a checkpoint
         if resume_from_checkpoint is None:
-            return result
+            return _orig_load(resume_from_checkpoint)
 
         optimizer = getattr(trainer, 'optimizer', None)
         if optimizer is None:
-            print("[Unsloth] Paged optimizer fix: trainer.optimizer is None after load")
-            return result
+            return _orig_load(resume_from_checkpoint)
 
-        # HF Trainer wraps the optimizer in AcceleratedOptimizer (or similar).
-        # Unwrap to find the actual bitsandbytes optimizer for the is_paged check.
+        # Unwrap AcceleratedOptimizer to find the actual bitsandbytes optimizer.
         inner = optimizer
         while hasattr(inner, 'optimizer') and inner is not getattr(inner, 'optimizer', None):
             inner = inner.optimizer
 
         inner_module = getattr(type(inner), '__module__', '') or ''
         inner_name   = type(inner).__name__
-        outer_paged  = getattr(optimizer, 'is_paged', None)
-        inner_paged  = getattr(inner,     'is_paged', None)
         is_bnb       = 'bitsandbytes' in inner_module
-        print(f"[Unsloth] Optimizer: {type(optimizer).__name__} / inner: {inner_name} ({inner_module})")
-        print(f"[Unsloth] is_paged: outer={outer_paged}, inner={inner_paged}, is_bnb={is_bnb}")
-        print(f"[Unsloth] State sizes: outer={len(optimizer.state)}, inner={len(inner.state)}")
+        print(f"[Unsloth] Optimizer: {type(optimizer).__name__} / inner: {inner_name}")
+        print(f"[Unsloth] is_bnb={is_bnb}, is_paged={getattr(inner, 'is_paged', False)}")
 
-        # Apply fix to:
-        #   a) explicitly paged optimizers (PagedAdamW8bit)  — is_paged=True on inner/outer
-        #   b) any other bitsandbytes 8-bit optimizer (AdamW8bit etc.) — detected via module
-        # For both cases we move GPU states to CPU and enable bitsandbytes paging
-        # so states are only on GPU transiently during optimizer.step().
-        # For plain PyTorch optimizers we skip (states must stay on GPU).
-        already_paged = bool(outer_paged) or bool(inner_paged)
-        if not (already_paged or is_bnb):
-            print("[Unsloth] Paged optimizer fix: not a bitsandbytes optimizer, skipping")
-            return result
+        if not is_bnb:
+            print("[Unsloth] Not a bitsandbytes optimizer, using default load")
+            return _orig_load(resume_from_checkpoint)
 
-        # bitsandbytes paging works by marking state tensors with is_paged=True
-        # and page_deviceid, then calling prefetch_state/unget_state in step().
-        # torch.load loses these attributes so loaded states stay on GPU.
+        # Root cause: HF Trainer loads optimizer.pt with map_location=cuda, putting
+        # ~9GB of optimizer states on GPU before training even starts.
         #
-        # Problem: bitsandbytes' prefetch_tensor() calls cudaMemPrefetchAsync,
-        # which only works on CUDA Unified Memory (cudaMallocManaged). Our tensors
-        # moved via v.data.cpu() are plain CPU tensors, not managed memory, so
-        # cudaMemPrefetchAsync returns "invalid argument" and crashes the kernel.
-        #
-        # Fix: patch bitsandbytes.functional.prefetch_tensor to use Python-level
-        # tensor moves (A.data = A.data.cuda() / A.data = A.data.cpu()) instead
-        # of the CUDA API. This is correct for all tensor types.
+        # Proper fix: load directly to CPU, then copy each state tensor into a
+        # properly allocated paged tensor using bitsandbytes' own get_paged().
+        # get_paged() allocates the correct backing memory (managed/pinned) that
+        # bitsandbytes' prefetch_tensor/unget_state CUDA APIs require.
+        # States then live on CPU and are only briefly on GPU during optimizer.step().
+        # No bitsandbytes internals are patched.
         try:
             import bitsandbytes.functional as bnb_f
-            _orig_prefetch = bnb_f.prefetch_tensor
 
-            def _python_prefetch(A, to_cpu=False):
-                if to_cpu:
-                    if A.data.device.type != 'cpu':
-                        A.data = A.data.cpu()
-                else:
-                    if A.data.device.type == 'cpu':
-                        A.data = A.data.cuda(getattr(A, 'page_deviceid', 0))
+            opt_path = os.path.join(str(resume_from_checkpoint), "optimizer.pt")
+            if not os.path.exists(opt_path):
+                print("[Unsloth] optimizer.pt not found, using default load")
+                return _orig_load(resume_from_checkpoint)
 
-            bnb_f.prefetch_tensor = _python_prefetch
-            print("[Unsloth] Patched bitsandbytes.functional.prefetch_tensor "
-                  "to use Python-level tensor moves (avoids cudaMemPrefetchAsync "
-                  "on non-managed memory)")
-        except Exception as e:
-            print(f"[Unsloth] Could not patch prefetch_tensor: {e}")
+            # Load state dict to CPU — never touches GPU
+            state_dict = torch.load(opt_path, map_location="cpu")
 
-        device_id = torch.cuda.current_device()
-        moved = 0
-        freed_bytes = 0
-        for group in inner.param_groups:
-            for p in group['params']:
-                if p not in inner.state:
-                    continue
-                for k, v in inner.state[p].items():
-                    if isinstance(v, torch.Tensor) and v.is_cuda:
-                        freed_bytes += v.numel() * v.element_size()
-                        v.data = v.data.cpu()        # in-place: same Python object, CPU storage
-                        v.is_paged = True             # mark for bitsandbytes prefetch_state check
-                        v.page_deviceid = device_id   # device index (needed by prefetch_tensor)
-                        moved += 1
+            # Replace every state tensor with a properly paged tensor so
+            # bitsandbytes' prefetch_state/unget_state work correctly.
+            device_id = torch.cuda.current_device()
+            paged_count = 0
+            if "state" in state_dict:
+                for param_state in state_dict["state"].values():
+                    for k, v in list(param_state.items()):
+                        if isinstance(v, torch.Tensor):
+                            paged = bnb_f.get_paged(*v.shape, dtype=v.dtype)
+                            paged.page_deviceid = device_id
+                            paged.copy_(v)
+                            param_state[k] = paged
+                            paged_count += 1
 
-        if moved > 0:
+            optimizer.load_state_dict(state_dict)
+
+            # Enable paging on the inner optimizer if not already set
+            # so optimizer.step() calls prefetch_state/unget_state
             if not getattr(inner, 'is_paged', False):
-                inner.is_paged = True  # enable paging on optimizer if not already set
-                print(f"[Unsloth] Enabled paging on {inner_name} optimizer")
-            torch.cuda.empty_cache()
-            print(f"[Unsloth] Paged optimizer fix: moved {moved} state tensors "
-                  f"to CPU, freed ~{freed_bytes/1e9:.2f}GB GPU memory")
-        else:
-            print(f"[Unsloth] Paged optimizer fix: no GPU state tensors found "
-                  f"(inner state count={len(inner.state)})")
+                inner.is_paged = True
+                print(f"[Unsloth] Enabled paging on {inner_name}")
 
-        return result
+            torch.cuda.empty_cache()
+            print(f"[Unsloth] Optimizer loaded to CPU via get_paged() "
+                  f"({paged_count} tensors, 0GB on GPU)")
+
+            # Load scheduler separately (same as HF Trainer does)
+            sched_path = os.path.join(str(resume_from_checkpoint), "scheduler.pt")
+            lr_scheduler = getattr(trainer, 'lr_scheduler', None)
+            if os.path.exists(sched_path) and lr_scheduler is not None:
+                lr_scheduler.load_state_dict(
+                    torch.load(sched_path, map_location="cpu")
+                )
+                print("[Unsloth] Scheduler loaded")
+
+        except Exception as e:
+            print(f"[Unsloth] CPU paged load failed ({e}), falling back to default")
+            return _orig_load(resume_from_checkpoint)
+
+        return None
 
     trainer._load_optimizer_and_scheduler = _patched_load
     print("[Unsloth] Paged optimizer resume fix installed. "
