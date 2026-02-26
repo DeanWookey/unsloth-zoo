@@ -92,6 +92,15 @@ def fix_zero_training_loss(model, tokenizer, train_dataset):
 pass
 
 
+def _mem(label):
+    """Print current GPU memory allocated and reserved."""
+    if not torch.cuda.is_available(): return
+    alloc   = torch.cuda.memory_allocated()  / 1024**3
+    reserved = torch.cuda.memory_reserved()  / 1024**3
+    print(f"[MEM] {label:<55} alloc={alloc:.2f}GB  reserved={reserved:.2f}GB")
+pass
+
+
 @torch.no_grad
 def prepare_model_for_training(
     model                      : Any,
@@ -112,6 +121,14 @@ def prepare_model_for_training(
     assert(type(train_embedding) is bool)
     assert(type(train_lm_head) is bool)
     assert(type(float32_mixed_precision) is bool)
+
+    print(f"\n{'='*70}")
+    print(f"[DEBUG] prepare_model_for_training() called")
+    print(f"[DEBUG]   full_finetuning         = {full_finetuning}")
+    print(f"[DEBUG]   float32_mixed_precision = {float32_mixed_precision}")
+    print(f"[DEBUG]   patch_modules_to_save   = {patch_modules_to_save}")
+    print(f"[DEBUG]   use_gradient_checkpointing = {use_gradient_checkpointing}")
+    _mem("START of prepare_model_for_training")
 
     dtype = _get_dtype(dtype_from_config(model.config))
     mixed_precision_dtype = torch.float32
@@ -138,6 +155,42 @@ def prepare_model_for_training(
         mixed_precision_dtype = torch.float32
         os.environ["UNSLOTH_MIXED_PRECISION"] = "float32"
     pass
+
+    print(f"[DEBUG]   model dtype             = {dtype}")
+    print(f"[DEBUG]   mixed_precision_dtype   = {mixed_precision_dtype}")
+    _mem("After dtype detection")
+
+    # Count what we're about to upcast before doing it
+    lora_params        = [(n, p) for n, p in model.named_parameters() if ".lora_A." in n or ".lora_B." in n or ".lora_magnitude_vector" in n]
+    modules_save_params = [(n, p) for n, p in model.named_parameters() if "modules_to_save" in n]
+    other_trainable    = [(n, p) for n, p in model.named_parameters() if p.requires_grad and n not in dict(lora_params) and n not in dict(modules_save_params)]
+
+    lora_numel  = sum(p.numel() for _, p in lora_params)
+    mts_numel   = sum(p.numel() for _, p in modules_save_params)
+    other_numel = sum(p.numel() for _, p in other_trainable)
+
+    print(f"\n[DEBUG] Parameter inventory BEFORE upcast:")
+    print(f"[DEBUG]   LoRA params (A/B):     {len(lora_params):>6} tensors  {lora_numel/1e6:>8.1f}M params  "
+          f"fp32={lora_numel*4/1e9:.2f}GB  bf16={lora_numel*2/1e9:.2f}GB")
+    print(f"[DEBUG]   modules_to_save:        {len(modules_save_params):>6} tensors  {mts_numel/1e6:>8.1f}M params  "
+          f"fp32={mts_numel*4/1e9:.2f}GB  bf16={mts_numel*2/1e9:.2f}GB")
+    print(f"[DEBUG]   other trainable:        {len(other_trainable):>6} tensors  {other_numel/1e6:>8.1f}M params")
+
+    # Show dtype breakdown of LoRA params before upcast
+    lora_dtype_counts = {}
+    for _, p in lora_params:
+        k = str(p.dtype)
+        lora_dtype_counts[k] = lora_dtype_counts.get(k, 0) + 1
+    print(f"[DEBUG]   LoRA dtype breakdown:  {lora_dtype_counts}")
+
+    # Show dtype breakdown of modules_to_save before upcast
+    if modules_save_params:
+        mts_dtype_counts = {}
+        for _, p in modules_save_params:
+            k = str(p.dtype)
+            mts_dtype_counts[k] = mts_dtype_counts.get(k, 0) + 1
+        print(f"[DEBUG]   modules_to_save dtypes: {mts_dtype_counts}")
+
     for name, param in model.named_parameters():
         upcast = False
         requires_grad = False
@@ -195,6 +248,19 @@ def prepare_model_for_training(
                 exec(f"model.{name}.to({str(torch.float32)})")
     pass
 
+    _mem("After LoRA upcast loop")
+
+    # Show dtype breakdown of LoRA params after upcast
+    lora_dtype_counts_after = {}
+    for _, p in lora_params:
+        k = str(p.dtype)
+        lora_dtype_counts_after[k] = lora_dtype_counts_after.get(k, 0) + 1
+    print(f"[DEBUG]   LoRA dtype breakdown AFTER upcast: {lora_dtype_counts_after}")
+
+    if lora_numel > 0:
+        expected_delta_gb = lora_numel * 2 / 1e9  # bf16->fp32 costs 2 extra bytes per param
+        print(f"[DEBUG]   Expected memory increase from upcast: ~{expected_delta_gb:.2f}GB")
+
     # Gradient checkpointing
     # If the user requested vanilla GC (True/False), ensure any prior Unsloth patch is undone.
     if use_gradient_checkpointing != "unsloth":
@@ -223,6 +289,8 @@ def prepare_model_for_training(
                 if hasattr(module, "gradient_checkpointing"):
                     module.gradient_checkpointing = False
 
+    _mem("After gradient checkpointing setup")
+
     # If use_reentrant = True which is the Pytorch default, we just make the input requires_grad.
     if use_reentrant:
         if hasattr(model, "enable_input_require_grads"):
@@ -234,12 +302,14 @@ def prepare_model_for_training(
     pass
 
     # Upcast modules_to_save
+    _mem("Before modules_to_save handling")
     if patch_modules_to_save:
         try:
             from peft.utils import ModulesToSaveWrapper
         except:
             ModulesToSaveWrapper = None
 
+        mts_count = 0
         for name, module in model.named_modules():
             if type(module) is ModulesToSaveWrapper or "ModulesToSave" in name:
                 if getattr(module, "original_module", None) is not None:
@@ -247,6 +317,7 @@ def prepare_model_for_training(
                 if getattr(module, "modules_to_save", None) is not None:
                     for saved_module in module.modules_to_save.modules():
                         if hasattr(saved_module, "weight"):
+                            mts_count += 1
                             if saved_module.weight.dtype == torch.float16:
                                 print(f"Unsloth: Upcasting `{name}` from float16 to float32 since it's in `modules_to_save`. Also allowing gradients.")
                                 saved_module.to(torch.float32)
@@ -258,7 +329,30 @@ def prepare_model_for_training(
                 pass
             pass
         pass
+        print(f"[DEBUG]   modules_to_save processed: {mts_count} modules")
+    else:
+        # Even if patch_modules_to_save=False, check if they exist and report
+        try:
+            from peft.utils import ModulesToSaveWrapper
+            found = [(n, m) for n, m in model.named_modules()
+                     if type(m) is ModulesToSaveWrapper or "ModulesToSave" in n]
+            if found:
+                total_mts_params = 0
+                for n, m in found:
+                    if getattr(m, "modules_to_save", None) is not None:
+                        for sm in m.modules_to_save.modules():
+                            if hasattr(sm, "weight"):
+                                total_mts_params += sm.weight.numel()
+                print(f"[DEBUG]   WARNING: {len(found)} ModulesToSaveWrapper(s) found but patch_modules_to_save=False!")
+                print(f"[DEBUG]   These hold {total_mts_params/1e6:.1f}M params "
+                      f"(fp32={total_mts_params*4/1e9:.2f}GB  bf16={total_mts_params*2/1e9:.2f}GB)")
+                print(f"[DEBUG]   Their requires_grad status will NOT be set here.")
+        except Exception as e:
+            print(f"[DEBUG]   Could not inspect ModulesToSaveWrapper: {e}")
     pass
+
+    _mem("END of prepare_model_for_training")
+    print(f"{'='*70}\n")
 
     return model
 pass
