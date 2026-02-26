@@ -557,23 +557,32 @@ def patch_paged_optimizer_resume_fix(trainer):
         while hasattr(inner, 'optimizer') and inner is not getattr(inner, 'optimizer', None):
             inner = inner.optimizer
 
-        outer_paged = getattr(optimizer, 'is_paged', None)
-        inner_paged = getattr(inner, 'is_paged', None)
-        print(f"[Unsloth] Optimizer type: {type(optimizer).__name__} / inner: {type(inner).__name__}")
-        print(f"[Unsloth] is_paged: outer={outer_paged}, inner={inner_paged}")
+        inner_module = getattr(type(inner), '__module__', '') or ''
+        inner_name   = type(inner).__name__
+        outer_paged  = getattr(optimizer, 'is_paged', None)
+        inner_paged  = getattr(inner,     'is_paged', None)
+        is_bnb       = 'bitsandbytes' in inner_module
+        print(f"[Unsloth] Optimizer: {type(optimizer).__name__} / inner: {inner_name} ({inner_module})")
+        print(f"[Unsloth] is_paged: outer={outer_paged}, inner={inner_paged}, is_bnb={is_bnb}")
         print(f"[Unsloth] State sizes: outer={len(optimizer.state)}, inner={len(inner.state)}")
 
-        # Accept if either the wrapper or the inner optimizer reports is_paged=True
-        if not (bool(outer_paged) or bool(inner_paged)):
-            print("[Unsloth] Paged optimizer fix: not a paged optimizer, skipping")
+        # Apply fix to:
+        #   a) explicitly paged optimizers (PagedAdamW8bit)  — is_paged=True on inner/outer
+        #   b) any other bitsandbytes 8-bit optimizer (AdamW8bit etc.) — detected via module
+        # For both cases we move GPU states to CPU and enable bitsandbytes paging
+        # so states are only on GPU transiently during optimizer.step().
+        # For plain PyTorch optimizers we skip (states must stay on GPU).
+        already_paged = bool(outer_paged) or bool(inner_paged)
+        if not (already_paged or is_bnb):
+            print("[Unsloth] Paged optimizer fix: not a bitsandbytes optimizer, skipping")
             return result
 
-        # bitsandbytes paging is just CPU<->GPU moves on tensors marked is_paged=True.
-        # prefetch_state does:  A.data = A.data.cuda()
-        # unprefetch does:      A.data = A.data.cpu()
-        # torch.load loses the is_paged attribute, so states stay on GPU permanently.
-        # Fix: move all state tensors back to CPU in-place on the inner optimizer,
-        # and restore is_paged=True so bitsandbytes prefetch_state() works correctly.
+        # bitsandbytes paging is just CPU<->GPU moves on tensors marked is_paged=True:
+        #   prefetch_state:  A.data = A.data.cuda()
+        #   unget_state:     A.data = A.data.cpu()
+        # torch.load loses the is_paged attribute so loaded states stay on GPU.
+        # Fix: move all loaded GPU states back to CPU in-place with is_paged=True,
+        # then set inner.is_paged=True so optimizer.step() calls prefetch/unget.
         moved = 0
         freed_bytes = 0
         for group in inner.param_groups:
@@ -584,10 +593,13 @@ def patch_paged_optimizer_resume_fix(trainer):
                     if isinstance(v, torch.Tensor) and v.is_cuda:
                         freed_bytes += v.numel() * v.element_size()
                         v.data = v.data.cpu()  # in-place: same Python object, CPU storage
-                        v.is_paged = True       # restore paging attribute
+                        v.is_paged = True       # mark for bitsandbytes prefetch
                         moved += 1
 
         if moved > 0:
+            if not getattr(inner, 'is_paged', False):
+                inner.is_paged = True  # enable paging on optimizer if not already set
+                print(f"[Unsloth] Enabled paging on {inner_name} optimizer")
             torch.cuda.empty_cache()
             print(f"[Unsloth] Paged optimizer fix: moved {moved} state tensors "
                   f"to CPU, freed ~{freed_bytes/1e9:.2f}GB GPU memory")
