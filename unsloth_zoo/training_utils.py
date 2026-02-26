@@ -585,21 +585,73 @@ def patch_paged_optimizer_resume_fix(trainer):
             # Load state dict to CPU — never touches GPU
             state_dict = torch.load(opt_path, map_location="cpu")
 
+            # Debug: print the top-level structure to understand format
+            if isinstance(state_dict, dict):
+                top_keys = list(state_dict.keys())
+                print(f"[Unsloth] state_dict type=dict, top-level keys={top_keys}")
+                for k in top_keys[:5]:
+                    v = state_dict[k]
+                    print(f"  [{k}]: type={type(v).__name__}", end="")
+                    if isinstance(v, dict):
+                        print(f", keys={list(v.keys())[:8]}")
+                    elif isinstance(v, list):
+                        print(f", len={len(v)}, first_type={type(v[0]).__name__ if v else 'empty'}")
+                    elif isinstance(v, torch.Tensor):
+                        print(f", shape={v.shape}, dtype={v.dtype}")
+                    else:
+                        print(f", val={v!r}"[:80])
+                # If it has a 'state' key, inspect first entry
+                if "state" in state_dict:
+                    s = state_dict["state"]
+                    print(f"  state: type={type(s).__name__}, len={len(s) if hasattr(s,'__len__') else '?'}")
+                    if isinstance(s, dict) and s:
+                        first_key = next(iter(s))
+                        first_val = s[first_key]
+                        print(f"  first state entry [{first_key}]: type={type(first_val).__name__}")
+                        if isinstance(first_val, dict):
+                            for sk, sv in list(first_val.items())[:5]:
+                                extra = f"shape={sv.shape} dtype={sv.dtype}" if isinstance(sv, torch.Tensor) else f"val={sv!r}"[:40]
+                                print(f"    {sk}: {type(sv).__name__} {extra}")
+            elif isinstance(state_dict, list):
+                print(f"[Unsloth] state_dict type=list, len={len(state_dict)}")
+                if state_dict:
+                    first = state_dict[0]
+                    print(f"  first element type={type(first).__name__}")
+                    if isinstance(first, dict):
+                        print(f"  first element keys={list(first.keys())}")
+
+            # Resolve the actual optimizer state dict — handle accelerate's various formats
+            # Accelerate may wrap the state in a list (one per optimizer) or under a key
+            opt_sd = state_dict
+            if isinstance(state_dict, list) and len(state_dict) > 0:
+                opt_sd = state_dict[0]
+                print("[Unsloth] Unwrapped list wrapper from state_dict")
+            elif isinstance(state_dict, dict) and "optimizer" in state_dict:
+                opt_sd = state_dict["optimizer"]
+                print("[Unsloth] Unwrapped 'optimizer' key from state_dict")
+
             # Replace every state tensor with a properly paged tensor so
             # bitsandbytes' prefetch_state/unget_state work correctly.
             device_id = torch.cuda.current_device()
             paged_count = 0
-            if "state" in state_dict:
-                for param_state in state_dict["state"].values():
+            if isinstance(opt_sd, dict) and "state" in opt_sd:
+                state_entries = opt_sd["state"]
+                print(f"[Unsloth] Found 'state' dict with {len(state_entries)} entries")
+                for param_state in state_entries.values():
+                    if not isinstance(param_state, dict):
+                        continue
                     for k, v in list(param_state.items()):
-                        if isinstance(v, torch.Tensor):
+                        if isinstance(v, torch.Tensor) and v.numel() > 1:
+                            # Only page non-scalar tensors (skip step counter etc.)
                             paged = bnb_f.get_paged(*v.shape, dtype=v.dtype)
                             paged.page_deviceid = device_id
                             paged.copy_(v)
                             param_state[k] = paged
                             paged_count += 1
+            else:
+                print(f"[Unsloth] WARNING: Could not find 'state' in opt_sd (type={type(opt_sd).__name__})")
 
-            optimizer.load_state_dict(state_dict)
+            optimizer.load_state_dict(opt_sd)
 
             # Enable paging on the inner optimizer if not already set
             # so optimizer.step() calls prefetch_state/unget_state
@@ -621,7 +673,10 @@ def patch_paged_optimizer_resume_fix(trainer):
                 print("[Unsloth] Scheduler loaded")
 
         except Exception as e:
-            print(f"[Unsloth] CPU paged load failed ({e}), falling back to default")
+            import traceback
+            print(f"[Unsloth] CPU paged load failed ({e})")
+            traceback.print_exc()
+            print("[Unsloth] Falling back to default _load_optimizer_and_scheduler")
             return _orig_load(resume_from_checkpoint)
 
         return None
