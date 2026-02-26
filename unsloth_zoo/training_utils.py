@@ -17,6 +17,7 @@
 import torch
 import math
 import datasets
+import threading
 from transformers import set_seed as transformers_set_seed
 from transformers import get_scheduler as transformers_get_scheduler
 from transformers import Trainer
@@ -37,6 +38,7 @@ __all__ = [
     "fix_zero_training_loss",
     "unsloth_train",
     "prepare_model_for_training",
+    "patch_trainer_for_memory_debugging",
 ]
 
 
@@ -356,6 +358,154 @@ def prepare_model_for_training(
 
     return model
 pass
+
+
+def patch_trainer_for_memory_debugging(trainer):
+    """
+    Patches key HF Trainer methods to log GPU memory at every major step
+    during trainer.train() startup. Call this BEFORE trainer.train().
+
+    Intercepts:
+      - create_optimizer
+      - create_scheduler
+      - _load_optimizer_and_scheduler  (resume path - where OOM is suspected)
+      - _get_train_dataloader
+      - training_step  (first step only, then unpatches itself)
+
+    Also starts a background thread that logs memory every 2s so you can
+    see the progression even inside opaque C++/CUDA calls.
+    """
+    # Background memory monitor thread
+    _stop_monitor = threading.Event()
+    _last_reported = [torch.cuda.memory_allocated() / 1024**3]
+
+    def _monitor_loop():
+        while not _stop_monitor.is_set():
+            alloc    = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved()  / 1024**3
+            delta    = alloc - _last_reported[0]
+            if abs(delta) >= 0.5:  # Only print when >= 0.5 GB change
+                print(f"[MEMMON] alloc={alloc:.2f}GB  reserved={reserved:.2f}GB  delta={delta:+.2f}GB")
+                _last_reported[0] = alloc
+            time.sleep(0.5)
+
+    monitor_thread = threading.Thread(target=_monitor_loop, daemon=True)
+    monitor_thread.start()
+    print(f"[DEBUG] Memory monitor started (reports on >=0.5GB changes)")
+    _mem("patch_trainer_for_memory_debugging - INITIAL")
+
+    # ------------------------------------------------------------------ #
+    # Helper: wrap a bound method with before/after memory prints
+    # ------------------------------------------------------------------ #
+    def _wrap(obj, method_name, label):
+        original = getattr(obj, method_name, None)
+        if original is None:
+            print(f"[DEBUG] WARNING: {method_name} not found on trainer - skipping patch")
+            return
+
+        def _wrapped(*args, **kwargs):
+            _mem(f"BEFORE {label}")
+            result = original(*args, **kwargs)
+            _mem(f"AFTER  {label}")
+            return result
+
+        import types
+        setattr(obj, method_name, types.MethodType(
+            lambda self, *a, **kw: _wrapped(*a, **kw), obj
+        ))
+
+    # ------------------------------------------------------------------ #
+    # Patch create_optimizer
+    # ------------------------------------------------------------------ #
+    _orig_create_optimizer = trainer.create_optimizer.__func__ \
+        if hasattr(trainer.create_optimizer, '__func__') else None
+
+    _orig_create_optimizer_bound = trainer.create_optimizer
+
+    def _patched_create_optimizer():
+        _mem("BEFORE create_optimizer")
+        result = _orig_create_optimizer_bound()
+        _mem("AFTER  create_optimizer")
+        # Print optimizer param group sizes
+        if hasattr(trainer, 'optimizer') and trainer.optimizer is not None:
+            for i, pg in enumerate(trainer.optimizer.param_groups):
+                n_params = sum(p.numel() for p in pg['params'])
+                print(f"[DEBUG]   optimizer param_group[{i}]: {n_params/1e6:.1f}M params")
+        return result
+
+    import types
+    trainer.create_optimizer = _patched_create_optimizer
+
+    # ------------------------------------------------------------------ #
+    # Patch _load_optimizer_and_scheduler (resume-specific - key suspect)
+    # ------------------------------------------------------------------ #
+    if hasattr(trainer, '_load_optimizer_and_scheduler'):
+        _orig_load_opt_sched = trainer._load_optimizer_and_scheduler
+
+        def _patched_load_opt_sched(resume_from_checkpoint):
+            print(f"\n[DEBUG] _load_optimizer_and_scheduler called with: {resume_from_checkpoint}")
+            _mem("BEFORE _load_optimizer_and_scheduler")
+
+            # Check what files exist in the checkpoint
+            if resume_from_checkpoint and isinstance(resume_from_checkpoint, str):
+                import os
+                opt_files = [f for f in os.listdir(resume_from_checkpoint)
+                             if 'optimizer' in f.lower() or 'scheduler' in f.lower()]
+                for f in opt_files:
+                    size_gb = os.path.getsize(
+                        os.path.join(resume_from_checkpoint, f)
+                    ) / 1024**3
+                    print(f"[DEBUG]   checkpoint file: {f}  size={size_gb:.2f}GB")
+
+            result = _orig_load_opt_sched(resume_from_checkpoint)
+            _mem("AFTER  _load_optimizer_and_scheduler")
+            return result
+
+        trainer._load_optimizer_and_scheduler = _patched_load_opt_sched
+    else:
+        print("[DEBUG] WARNING: _load_optimizer_and_scheduler not found on trainer")
+
+    # ------------------------------------------------------------------ #
+    # Patch _get_train_dataloader
+    # ------------------------------------------------------------------ #
+    if hasattr(trainer, 'get_train_dataloader'):
+        _orig_get_dataloader = trainer.get_train_dataloader
+
+        def _patched_get_dataloader():
+            _mem("BEFORE get_train_dataloader")
+            result = _orig_get_dataloader()
+            _mem("AFTER  get_train_dataloader")
+            return result
+
+        trainer.get_train_dataloader = _patched_get_dataloader
+
+    # ------------------------------------------------------------------ #
+    # Patch training_step to catch first step and stop monitor after crash
+    # ------------------------------------------------------------------ #
+    if hasattr(trainer, 'training_step'):
+        _orig_training_step = trainer.training_step
+        _step_count = [0]
+
+        def _patched_training_step(model, inputs, *args, **kwargs):
+            if _step_count[0] == 0:
+                _mem("BEFORE first training_step (forward+backward)")
+            try:
+                result = _orig_training_step(model, inputs, *args, **kwargs)
+            except torch.cuda.OutOfMemoryError:
+                _mem("OOM INSIDE training_step")
+                _stop_monitor.set()
+                raise
+            if _step_count[0] == 0:
+                _mem("AFTER  first training_step")
+            _step_count[0] += 1
+            return result
+
+        import types
+        trainer.training_step = types.MethodType(_patched_training_step, trainer)
+
+    print(f"[DEBUG] Trainer patched. Call trainer.train() now.")
+    print(f"[DEBUG] To stop memory monitor: call the returned stop_fn()")
+    return _stop_monitor.set  # Return a function to stop the monitor
 
 
 def get_max_steps(training_args, n_training_samples, train_dataset):
