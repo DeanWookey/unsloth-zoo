@@ -577,12 +577,14 @@ def patch_paged_optimizer_resume_fix(trainer):
             print("[Unsloth] Paged optimizer fix: not a bitsandbytes optimizer, skipping")
             return result
 
-        # bitsandbytes paging is just CPU<->GPU moves on tensors marked is_paged=True:
-        #   prefetch_state:  A.data = A.data.cuda()
-        #   unget_state:     A.data = A.data.cpu()
-        # torch.load loses the is_paged attribute so loaded states stay on GPU.
-        # Fix: move all loaded GPU states back to CPU in-place with is_paged=True,
-        # then set inner.is_paged=True so optimizer.step() calls prefetch/unget.
+        # bitsandbytes paging works via three attributes on each state tensor:
+        #   is_paged=True      : marks tensor as paged (checked by prefetch_state)
+        #   page_deviceid=N    : CUDA device index for cudaMemPrefetchAsync
+        # torch.load loses all three so loaded states stay on GPU permanently.
+        # Fix: move all loaded GPU states back to CPU in-place and restore all
+        # three attributes, then set inner.is_paged=True so optimizer.step()
+        # calls prefetch_state/unget_state to page on/off GPU during update.
+        device_id = torch.cuda.current_device()
         moved = 0
         freed_bytes = 0
         for group in inner.param_groups:
@@ -592,8 +594,9 @@ def patch_paged_optimizer_resume_fix(trainer):
                 for k, v in inner.state[p].items():
                     if isinstance(v, torch.Tensor) and v.is_cuda:
                         freed_bytes += v.numel() * v.element_size()
-                        v.data = v.data.cpu()  # in-place: same Python object, CPU storage
-                        v.is_paged = True       # mark for bitsandbytes prefetch
+                        v.data = v.data.cpu()    # in-place: same Python object, CPU storage
+                        v.is_paged = True         # mark for bitsandbytes prefetch_state check
+                        v.page_deviceid = device_id  # CUDA device for cudaMemPrefetchAsync
                         moved += 1
 
         if moved > 0:
