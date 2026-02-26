@@ -39,6 +39,7 @@ __all__ = [
     "unsloth_train",
     "prepare_model_for_training",
     "patch_trainer_for_memory_debugging",
+    "patch_paged_optimizer_resume_fix",
 ]
 
 
@@ -500,12 +501,90 @@ def patch_trainer_for_memory_debugging(trainer):
             _step_count[0] += 1
             return result
 
-        import types
-        trainer.training_step = types.MethodType(_patched_training_step, trainer)
+        trainer.training_step = _patched_training_step
 
     print(f"[DEBUG] Trainer patched. Call trainer.train() now.")
     print(f"[DEBUG] To stop memory monitor: call the returned stop_fn()")
     return _stop_monitor.set  # Return a function to stop the monitor
+
+
+def patch_paged_optimizer_resume_fix(trainer):
+    """
+    Fixes OOM when resuming from checkpoint with paged optimizers (e.g. paged_adamw_8bit).
+
+    Root cause:
+        torch.save/load does NOT preserve the is_paged=True attribute on tensors.
+        When optimizer states are loaded from a checkpoint, they land on GPU memory
+        without is_paged=True. bitsandbytes normally pages optimizer states between
+        CPU and GPU (only on GPU during the optimizer.step() call), but after
+        checkpoint loading they stay on GPU permanently, wasting ~9-10GB.
+
+    Fix:
+        Wrap _load_optimizer_and_scheduler so that after loading, any GPU optimizer
+        state tensors are moved back to CPU in-place and marked is_paged=True.
+        bitsandbytes' prefetch_state() will then manage them correctly (it does
+        A.data = A.data.cuda() / A.data = A.data.cpu() as needed during step()).
+
+    Usage:
+        Call this BEFORE trainer.train() when resuming from a checkpoint:
+
+            from unsloth_zoo.training_utils import patch_paged_optimizer_resume_fix
+            patch_paged_optimizer_resume_fix(trainer)
+            trainer.train(resume_from_checkpoint=checkpoint_path)
+    """
+    if not hasattr(trainer, '_load_optimizer_and_scheduler'):
+        print("[Unsloth] WARNING: _load_optimizer_and_scheduler not found on trainer, "
+              "cannot apply paged optimizer resume fix")
+        return
+
+    _orig_load = trainer._load_optimizer_and_scheduler
+
+    def _patched_load(resume_from_checkpoint):
+        result = _orig_load(resume_from_checkpoint)
+
+        # Only act when actually resuming from a checkpoint
+        if resume_from_checkpoint is None:
+            return result
+
+        optimizer = getattr(trainer, 'optimizer', None)
+        if optimizer is None:
+            return result
+
+        # Only apply to paged optimizers (paged_adamw_8bit etc.)
+        if not getattr(optimizer, 'is_paged', False):
+            return result
+
+        # bitsandbytes paging is just CPU<->GPU moves on tensors marked is_paged=True.
+        # prefetch_state does:  A.data = A.data.cuda()
+        # unprefetch does:      A.data = A.data.cpu()
+        # torch.load loses the is_paged attribute, so states stay on GPU permanently.
+        # Fix: move all state tensors back to CPU in-place and restore is_paged=True.
+        moved = 0
+        freed_bytes = 0
+        for group in optimizer.param_groups:
+            for p in group['params']:
+                if p not in optimizer.state:
+                    continue
+                for k, v in optimizer.state[p].items():
+                    if isinstance(v, torch.Tensor) and v.is_cuda:
+                        freed_bytes += v.numel() * v.element_size()
+                        v.data = v.data.cpu()  # in-place: same Python object, CPU storage
+                        v.is_paged = True       # restore paging attribute
+                        moved += 1
+
+        if moved > 0:
+            torch.cuda.empty_cache()
+            print(f"[Unsloth] Paged optimizer resume fix: moved {moved} state tensors "
+                  f"to CPU, freed ~{freed_bytes/1e9:.2f}GB GPU memory")
+        else:
+            print("[Unsloth] Paged optimizer resume fix: no GPU state tensors found "
+                  "(optimizer may not have been loaded yet)")
+
+        return result
+
+    trainer._load_optimizer_and_scheduler = _patched_load
+    print("[Unsloth] Paged optimizer resume fix installed. "
+          "Optimizer states will be moved to CPU after checkpoint loading.")
 
 
 def get_max_steps(training_args, n_training_samples, train_dataset):
