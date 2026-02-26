@@ -548,24 +548,39 @@ def patch_paged_optimizer_resume_fix(trainer):
 
         optimizer = getattr(trainer, 'optimizer', None)
         if optimizer is None:
+            print("[Unsloth] Paged optimizer fix: trainer.optimizer is None after load")
             return result
 
-        # Only apply to paged optimizers (paged_adamw_8bit etc.)
-        if not getattr(optimizer, 'is_paged', False):
+        # HF Trainer wraps the optimizer in AcceleratedOptimizer (or similar).
+        # Unwrap to find the actual bitsandbytes optimizer for the is_paged check.
+        inner = optimizer
+        while hasattr(inner, 'optimizer') and inner is not getattr(inner, 'optimizer', None):
+            inner = inner.optimizer
+
+        outer_paged = getattr(optimizer, 'is_paged', None)
+        inner_paged = getattr(inner, 'is_paged', None)
+        print(f"[Unsloth] Optimizer type: {type(optimizer).__name__} / inner: {type(inner).__name__}")
+        print(f"[Unsloth] is_paged: outer={outer_paged}, inner={inner_paged}")
+        print(f"[Unsloth] State sizes: outer={len(optimizer.state)}, inner={len(inner.state)}")
+
+        # Accept if either the wrapper or the inner optimizer reports is_paged=True
+        if not (bool(outer_paged) or bool(inner_paged)):
+            print("[Unsloth] Paged optimizer fix: not a paged optimizer, skipping")
             return result
 
         # bitsandbytes paging is just CPU<->GPU moves on tensors marked is_paged=True.
         # prefetch_state does:  A.data = A.data.cuda()
         # unprefetch does:      A.data = A.data.cpu()
         # torch.load loses the is_paged attribute, so states stay on GPU permanently.
-        # Fix: move all state tensors back to CPU in-place and restore is_paged=True.
+        # Fix: move all state tensors back to CPU in-place on the inner optimizer,
+        # and restore is_paged=True so bitsandbytes prefetch_state() works correctly.
         moved = 0
         freed_bytes = 0
-        for group in optimizer.param_groups:
+        for group in inner.param_groups:
             for p in group['params']:
-                if p not in optimizer.state:
+                if p not in inner.state:
                     continue
-                for k, v in optimizer.state[p].items():
+                for k, v in inner.state[p].items():
                     if isinstance(v, torch.Tensor) and v.is_cuda:
                         freed_bytes += v.numel() * v.element_size()
                         v.data = v.data.cpu()  # in-place: same Python object, CPU storage
@@ -574,11 +589,11 @@ def patch_paged_optimizer_resume_fix(trainer):
 
         if moved > 0:
             torch.cuda.empty_cache()
-            print(f"[Unsloth] Paged optimizer resume fix: moved {moved} state tensors "
+            print(f"[Unsloth] Paged optimizer fix: moved {moved} state tensors "
                   f"to CPU, freed ~{freed_bytes/1e9:.2f}GB GPU memory")
         else:
-            print("[Unsloth] Paged optimizer resume fix: no GPU state tensors found "
-                  "(optimizer may not have been loaded yet)")
+            print(f"[Unsloth] Paged optimizer fix: no GPU state tensors found "
+                  f"(inner state count={len(inner.state)})")
 
         return result
 
