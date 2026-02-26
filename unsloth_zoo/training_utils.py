@@ -382,9 +382,12 @@ def patch_trainer_for_memory_debugging(trainer):
 
     def _monitor_loop():
         while not _stop_monitor.is_set():
-            alloc    = torch.cuda.memory_allocated() / 1024**3
-            reserved = torch.cuda.memory_reserved()  / 1024**3
-            delta    = alloc - _last_reported[0]
+            try:
+                alloc    = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved()  / 1024**3
+            except Exception:
+                break  # CUDA shutting down, exit cleanly
+            delta = alloc - _last_reported[0]
             if abs(delta) >= 0.5:  # Only print when >= 0.5 GB change
                 print(f"[MEMMON] alloc={alloc:.2f}GB  reserved={reserved:.2f}GB  delta={delta:+.2f}GB")
                 _last_reported[0] = alloc
