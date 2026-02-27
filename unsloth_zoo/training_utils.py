@@ -625,7 +625,19 @@ def patch_paged_optimizer_resume_fix(trainer):
                         p_state[k] = v.cuda(non_blocking=True)
             torch.cuda.synchronize()
 
+            # For paged_adamw_8bit the optimizer has is_paged=True, which causes
+            # bitsandbytes' step() to call prefetch_tensor() on each state tensor.
+            # Our states are plain CUDA tensors (not cudaMallocManaged), so
+            # prefetch_tensor would crash.  Temporarily disable the paged code
+            # path — our wrapper already handles the CPU↔GPU transfers.
+            was_paged = getattr(inner, 'is_paged', False)
+            if was_paged:
+                inner.is_paged = False
+
             step_result = _orig_step(*args, **kwargs)
+
+            if was_paged:
+                inner.is_paged = True   # restore original identity
 
             # Return states to pinned CPU memory after the update.
             torch.cuda.synchronize()
