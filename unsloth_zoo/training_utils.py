@@ -612,48 +612,70 @@ def patch_paged_optimizer_resume_fix(trainer):
             traceback.print_exc()
             return result   # nothing more we can do
 
-        # Step 3: Wrap inner.step() so states are on GPU only during the CUDA
-        # kernels and returned to CPU immediately after.  Uses plain .cuda() /
-        # .cpu() — no bitsandbytes managed-memory CUDA APIs involved.
+        # Step 3: Install a step wrapper appropriate for the optimizer type.
+        #
+        # Non-paged (adamw_8bit): states must live on GPU permanently for
+        #   normal operation.  Install a one-shot wrapper that restores them on
+        #   the first step and then removes itself — zero overhead thereafter.
+        #
+        # Paged (paged_adamw_8bit): states are *intended* to live on CPU between
+        #   steps; the ongoing CPU↔GPU wrapper is the correct behaviour here.
+        #   We disable is_paged during the bitsandbytes step() call because
+        #   bitsandbytes' paged path calls prefetch_tensor(), which requires
+        #   cudaMallocManaged pointers — our plain CUDA tensors would crash it.
+        #   Using try/finally ensures is_paged is always restored.
         _orig_step = inner.step  # bound method — self already captured
+        is_paged   = getattr(inner, 'is_paged', False)
 
-        def _cpu_offloaded_step(*args, **kwargs):
-            # Bring states to GPU for CUDA kernel execution.
-            for p_state in inner.state.values():
-                for k, v in list(p_state.items()):
-                    if isinstance(v, torch.Tensor) and not v.is_cuda and v.numel() > 1:
-                        p_state[k] = v.cuda(non_blocking=True)
-            torch.cuda.synchronize()
+        if not is_paged:
+            # --- Non-paged: one-shot restore, then zero ongoing overhead ---
+            def _restore_on_first_step(*args, **kwargs):
+                for p_state in inner.state.values():
+                    for k, v in list(p_state.items()):
+                        if isinstance(v, torch.Tensor) and not v.is_cuda and v.numel() > 1:
+                            p_state[k] = v.cuda(non_blocking=True)
+                torch.cuda.synchronize()
+                inner.step = _orig_step   # remove wrapper after first call
+                return _orig_step(*args, **kwargs)
 
-            # For paged_adamw_8bit the optimizer has is_paged=True, which causes
-            # bitsandbytes' step() to call prefetch_tensor() on each state tensor.
-            # Our states are plain CUDA tensors (not cudaMallocManaged), so
-            # prefetch_tensor would crash.  Temporarily disable the paged code
-            # path — our wrapper already handles the CPU↔GPU transfers.
-            was_paged = getattr(inner, 'is_paged', False)
-            if was_paged:
+            inner.step = _restore_on_first_step
+            print(f"[Unsloth] One-shot restore wrapper installed on {inner_name}: "
+                  f"states will be moved back to GPU on the first optimizer step.")
+
+        else:
+            # --- Paged: ongoing CPU↔GPU wrapper (correct paged semantics) ---
+            def _cpu_offloaded_step(*args, **kwargs):
+                # Bring states to GPU for CUDA kernel execution.
+                for p_state in inner.state.values():
+                    for k, v in list(p_state.items()):
+                        if isinstance(v, torch.Tensor) and not v.is_cuda and v.numel() > 1:
+                            p_state[k] = v.cuda(non_blocking=True)
+                torch.cuda.synchronize()
+
+                # Disable bitsandbytes' managed-memory prefetch path for the
+                # duration of the step — our plain CUDA tensors are not
+                # cudaMallocManaged and prefetch_tensor would crash on them.
                 inner.is_paged = False
+                try:
+                    step_result = _orig_step(*args, **kwargs)
+                finally:
+                    inner.is_paged = True  # restore regardless of exceptions
 
-            step_result = _orig_step(*args, **kwargs)
+                # Return states to pinned CPU memory after the update.
+                torch.cuda.synchronize()
+                for p_state in inner.state.values():
+                    for k, v in list(p_state.items()):
+                        if isinstance(v, torch.Tensor) and v.is_cuda and v.numel() > 1:
+                            try:
+                                p_state[k] = v.cpu().pin_memory()
+                            except Exception:
+                                p_state[k] = v.cpu()
+                torch.cuda.empty_cache()
+                return step_result
 
-            if was_paged:
-                inner.is_paged = True   # restore original identity
-
-            # Return states to pinned CPU memory after the update.
-            torch.cuda.synchronize()
-            for p_state in inner.state.values():
-                for k, v in list(p_state.items()):
-                    if isinstance(v, torch.Tensor) and v.is_cuda and v.numel() > 1:
-                        try:
-                            p_state[k] = v.cpu().pin_memory()
-                        except Exception:
-                            p_state[k] = v.cpu()
-            torch.cuda.empty_cache()
-            return step_result
-
-        inner.step = _cpu_offloaded_step
-        print(f"[Unsloth] Step wrapper installed on {inner_name}: "
-              f"optimizer states will live on CPU between steps.")
+            inner.step = _cpu_offloaded_step
+            print(f"[Unsloth] Ongoing CPU offload wrapper installed on {inner_name}: "
+                  f"optimizer states will live on CPU between steps.")
 
         return result
 
