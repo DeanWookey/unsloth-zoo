@@ -520,21 +520,21 @@ def patch_paged_optimizer_resume_fix(trainer):
         PyTorch's Optimizer.load_state_dict() always calls .to(param.device) on
         every state tensor.  For GPU parameters this means ~9GB of optimizer states
         land on the GPU and stay there for the entire training run.  In fresh
-        training the states are created lazily during optimizer.step(), after the
-        first forward+backward pass frees temporary activations — so peak memory
-        is lower.  With checkpoint loading all 9GB are pre-loaded before any
-        computation starts, pushing peak GPU memory over the limit.
+        training the states are created lazily inside optimizer.step(), AFTER the
+        first forward+backward frees activations — so peak memory is lower.
+        With checkpoint loading all 9GB are pre-loaded before any computation,
+        pushing peak GPU memory over the limit.
 
-    Fix (post-load migration):
-        1. Let _load_optimizer_and_scheduler run normally (states go to GPU).
-        2. Immediately after: iterate inner.state and replace each GPU tensor
-           with a bitsandbytes get_paged() tensor (CUDA managed / unified memory).
-        3. Call prefetch_tensor(paged, to_cpu=True) to migrate managed memory to
-           CPU RAM.  The original GPU tensor is released, freeing ~9GB.
-        4. Set inner.is_paged=True so bitsandbytes' step() calls
-           prefetch_tensor(to_cpu=False) before each CUDA kernel (moves states to
-           GPU transiently) and prefetch_tensor(to_cpu=True) after (returns them
-           to CPU).  States occupy GPU only during optimizer.step().
+    Fix (CPU offload + step wrapper):
+        1. Let _load_optimizer_and_scheduler run normally (states land on GPU).
+        2. Immediately after: move every non-scalar GPU state tensor to pinned
+           CPU memory, freeing ~9GB from the GPU.
+        3. Wrap inner.step() so that on each optimizer step:
+              a. States are moved GPU (non_blocking) for the CUDA kernels.
+              b. The original step() runs.
+              c. States are moved back to CPU.
+           This avoids bitsandbytes managed-memory / prefetch_tensor CUDA APIs
+           entirely — plain .cuda() / .cpu() transfers are sufficient.
 
     Usage:
         Call this BEFORE trainer.train() when resuming from a checkpoint:
@@ -573,82 +573,75 @@ def patch_paged_optimizer_resume_fix(trainer):
             print("[Unsloth] Not a bitsandbytes optimizer, using default load")
             return _orig_load(resume_from_checkpoint)
 
-        # Root cause: PyTorch optimizer.load_state_dict() always calls
-        # .to(param.device) on every state tensor, so states always land on GPU
-        # (~9GB) regardless of where they are in the saved state dict.
-        #
-        # Correct fix (post-load migration):
-        #   1. Let _orig_load run — states land in inner.state on GPU (normal).
-        #   2. Immediately after: replace each GPU state tensor in inner.state
-        #      with a bitsandbytes get_paged() tensor (CUDA managed memory).
-        #   3. Call prefetch_tensor(paged, to_cpu=True) to move managed memory
-        #      to CPU RAM.  During optimizer.step(), bitsandbytes calls
-        #      prefetch_tensor(to_cpu=False) to pull it back to GPU, runs the
-        #      CUDA kernel, then prefetch_tensor(to_cpu=True) to return it.
-        #
-        # Result: ~9GB of optimizer states live on CPU between steps instead of
-        # permanently occupying GPU memory.
-
+        # Step 1: Let original load run — states land in inner.state on GPU.
+        # PyTorch optimizer.load_state_dict() always calls .to(param.device) on
+        # every tensor, so trying to pre-populate with CPU tensors does nothing.
         before_gb = torch.cuda.memory_allocated() / 1e9
-        result = _orig_load(resume_from_checkpoint)
-        after_gb = torch.cuda.memory_allocated() / 1e9
+        result    = _orig_load(resume_from_checkpoint)
+        after_gb  = torch.cuda.memory_allocated() / 1e9
         print(f"[Unsloth] After original load: {after_gb:.2f}GB "
               f"(+{after_gb - before_gb:.2f}GB landed on GPU)")
 
+        # Step 2: Move GPU state tensors to pinned CPU memory.
+        # Pinned memory enables faster non_blocking transfers back to GPU in step().
         try:
-            import bitsandbytes.functional as bnb_f
-            device_id = torch.cuda.current_device()
-            paged_count = 0
+            moved_count = 0
             freed_bytes = 0
-
-            # inner.state maps param_tensor → {key: state_tensor, ...}
             for p_state in inner.state.values():
                 for k, v in list(p_state.items()):
-                    # Only migrate non-scalar GPU tensors (skip step counters etc.)
                     if not isinstance(v, torch.Tensor) or not v.is_cuda or v.numel() <= 1:
                         continue
-
-                    # Allocate CUDA managed memory (cudaMallocManaged) and copy
-                    # the GPU state tensor into it.
-                    paged = bnb_f.get_paged(*v.shape, dtype=v.dtype)
-                    paged.is_paged    = True
-                    paged.page_deviceid = device_id
-                    paged.copy_(v)          # device memcpy: GPU → managed GPU
-
-                    # Replace in live optimizer state, then release the original
-                    # GPU tensor so its memory is returned to the CUDA cache.
                     freed_bytes += v.nbytes
-                    p_state[k] = paged
+                    try:
+                        p_state[k] = v.cpu().pin_memory()
+                    except Exception:
+                        p_state[k] = v.cpu()
                     del v
+                    moved_count += 1
 
-                    # Hint the CUDA runtime to migrate managed memory to CPU RAM.
-                    # bitsandbytes will call prefetch_tensor(to_cpu=False) at the
-                    # start of each step to pull it back to GPU, and
-                    # prefetch_tensor(to_cpu=True) after to return it.
-                    bnb_f.prefetch_tensor(paged, to_cpu=True)
-                    paged_count += 1
-
-            # Activate the paged step path on the optimizer so bitsandbytes
-            # calls prefetch_tensor / unget_state around each CUDA kernel.
-            if not getattr(inner, 'is_paged', False):
-                inner.is_paged = True
-                print(f"[Unsloth] Enabled paged step path on {inner_name}")
-
-            # Flush CUDA allocator cache to return freed GPU memory to the OS.
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
-
             final_gb = torch.cuda.memory_allocated() / 1e9
-            print(f"[Unsloth] Post-load migration complete: "
-                  f"{paged_count} tensors moved to paged CPU memory, "
-                  f"freed {freed_bytes / 1e9:.2f}GB. "
-                  f"GPU now: {final_gb:.2f}GB")
+            print(f"[Unsloth] Moved {moved_count} state tensors to CPU, "
+                  f"freed {freed_bytes / 1e9:.2f}GB. GPU now: {final_gb:.2f}GB")
 
         except Exception as e:
             import traceback
-            print(f"[Unsloth] Post-load migration failed ({e}), "
+            print(f"[Unsloth] State migration to CPU failed ({e}), "
                   f"optimizer states remain on GPU")
             traceback.print_exc()
+            return result   # nothing more we can do
+
+        # Step 3: Wrap inner.step() so states are on GPU only during the CUDA
+        # kernels and returned to CPU immediately after.  Uses plain .cuda() /
+        # .cpu() — no bitsandbytes managed-memory CUDA APIs involved.
+        _orig_step = inner.step  # bound method — self already captured
+
+        def _cpu_offloaded_step(*args, **kwargs):
+            # Bring states to GPU for CUDA kernel execution.
+            for p_state in inner.state.values():
+                for k, v in list(p_state.items()):
+                    if isinstance(v, torch.Tensor) and not v.is_cuda and v.numel() > 1:
+                        p_state[k] = v.cuda(non_blocking=True)
+            torch.cuda.synchronize()
+
+            step_result = _orig_step(*args, **kwargs)
+
+            # Return states to pinned CPU memory after the update.
+            torch.cuda.synchronize()
+            for p_state in inner.state.values():
+                for k, v in list(p_state.items()):
+                    if isinstance(v, torch.Tensor) and v.is_cuda and v.numel() > 1:
+                        try:
+                            p_state[k] = v.cpu().pin_memory()
+                        except Exception:
+                            p_state[k] = v.cpu()
+            torch.cuda.empty_cache()
+            return step_result
+
+        inner.step = _cpu_offloaded_step
+        print(f"[Unsloth] Step wrapper installed on {inner_name}: "
+              f"optimizer states will live on CPU between steps.")
 
         return result
 
