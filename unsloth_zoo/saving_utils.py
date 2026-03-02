@@ -418,6 +418,34 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             if name.endswith(".base_layer.weight"):
                 name = name[:-len(".base_layer.weight")]
 
+            # Handle modules_to_save wrapper keys.  When a layer (e.g. embed_tokens,
+            # lm_head) is in PEFT's modules_to_save, its state_dict keys expand to:
+            #   "model.embed_tokens.modules_to_save.default.weight"
+            #   "model.embed_tokens.original_module.weight"
+            # The loop key never matches the plain "model.embed_tokens" entry in
+            # lora_weights, so the saved weight is never emitted into state_dict.
+            # Detect these keys, look up the base name in lora_weights, and emit
+            # the saved weight under the normalised key (e.g. "model.embed_tokens.weight").
+            if ".modules_to_save." in name:
+                if name.endswith(".weight") or name.endswith(".bias"):
+                    mts_base = name[:name.index(".modules_to_save.")]
+                    suffix   = name[name.rfind("."):]          # ".weight" or ".bias"
+                    out_key  = mts_base + suffix
+                    if out_key not in state_dict:
+                        mts_stat = lora_weights.get(mts_base)
+                        if mts_stat is not None and mts_stat.module is not None:
+                            if suffix == ".weight":
+                                saved_w = _get_modules_to_save_weight(mts_stat.module)
+                            else:
+                                default_mod = getattr(mts_stat.module, "modules_to_save", {}).get("default")
+                                saved_w = getattr(default_mod, "bias", None) if default_mod else None
+                            if saved_w is not None:
+                                state_dict[out_key] = saved_w
+                continue   # always skip raw modules_to_save keys
+
+            if ".original_module." in name:
+                continue   # always skip; weights captured via modules_to_save above
+
             if name in lora_weights:
                 state_dict[name + ".weight"]   = lora_weights[name]
                 if getattr(lora_weights[name].module, "bias", None) is not None:
